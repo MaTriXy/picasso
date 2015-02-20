@@ -15,15 +15,13 @@
  */
 package com.squareup.picasso;
 
-import android.app.ActivityManager;
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.os.Build;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import static android.content.Context.ACTIVITY_SERVICE;
-import static android.content.pm.ApplicationInfo.FLAG_LARGE_HEAP;
+import static com.squareup.picasso.Utils.KEY_SEPARATOR;
 
 /** A memory cache which uses a least-recently used eviction policy. */
 public class LruCache implements Cache {
@@ -38,7 +36,7 @@ public class LruCache implements Cache {
 
   /** Create a cache using an appropriate portion of the available RAM as the maximum size. */
   public LruCache(Context context) {
-    this(calculateMaxSize(context));
+    this(Utils.calculateMemoryCacheSize(context));
   }
 
   /** Create a cache with a given maximum size in bytes. */
@@ -115,14 +113,35 @@ public class LruCache implements Cache {
     trimToSize(-1); // -1 will evict 0-sized elements
   }
 
-  /** Returns the sum of the sizes of the entries in this cache. */
-  public final synchronized int size() {
+  @Override public final synchronized int size() {
     return size;
   }
 
-  /** Returns the maximum sum of the sizes of the entries in this cache. */
-  public final synchronized int maxSize() {
+  @Override public final synchronized int maxSize() {
     return maxSize;
+  }
+
+  @Override public final synchronized void clear() {
+    evictAll();
+  }
+
+  @Override public final synchronized void clearKeyUri(String uri) {
+    boolean sizeChanged = false;
+    int uriLength = uri.length();
+    for (Iterator<Map.Entry<String, Bitmap>> i = map.entrySet().iterator(); i.hasNext();) {
+      Map.Entry<String, Bitmap> entry = i.next();
+      String key = entry.getKey();
+      Bitmap value = entry.getValue();
+      int newlineIndex = key.indexOf(KEY_SEPARATOR);
+      if (newlineIndex == uriLength && key.substring(0, newlineIndex).equals(uri)) {
+        i.remove();
+        size -= Utils.getBitmapBytes(value);
+        sizeChanged = true;
+      }
+    }
+    if (sizeChanged) {
+      trimToSize(maxSize);
+    }
   }
 
   /** Returns the number of times {@link #get} returned a value. */
@@ -135,7 +154,7 @@ public class LruCache implements Cache {
     return missCount;
   }
 
-  /** Returns the number of times {@link #set(String, android.graphics.Bitmap)} was called. */
+  /** Returns the number of times {@link #set(String, Bitmap)} was called. */
   public final synchronized int putCount() {
     return putCount;
   }
@@ -143,21 +162,5 @@ public class LruCache implements Cache {
   /** Returns the number of values that have been evicted. */
   public final synchronized int evictionCount() {
     return evictionCount;
-  }
-
-  private static int calculateMaxSize(Context context) {
-    ActivityManager am = (ActivityManager) context.getSystemService(ACTIVITY_SERVICE);
-    boolean largeHeap = (context.getApplicationInfo().flags & FLAG_LARGE_HEAP) != 0;
-    int memoryClass = am.getMemoryClass();
-    if (largeHeap && Build.VERSION.SDK_INT <= Build.VERSION_CODES.HONEYCOMB) {
-      memoryClass = ActivityManagerHoneycomb.getLargeMemoryClass(am);
-    }
-    return 1024 * 1024 * memoryClass / 6;
-  }
-
-  private static class ActivityManagerHoneycomb {
-    static int getLargeMemoryClass(ActivityManager activityManager) {
-      return activityManager.getLargeMemoryClass();
-    }
   }
 }

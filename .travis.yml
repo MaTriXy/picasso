@@ -1,18 +1,33 @@
-language: java
+language: android
+
+android:
+  components:
+    - build-tools-20.0.0
+    - android-17
+  licenses:
+    - android-sdk-license-5be876d5
+
+jdk:
+  - oraclejdk7
+  - oraclejdk8
+
+after_success:
+  - .buildscript/deploy_snapshot.sh
+
+env:
+  global:
+    - secure: "K6cyrlYhMmCHeez4uwkcQ5QeRLdCiegbbHnj8qKzbgcu0cDsvr2mMr6LLtjMOay1KMaxrW3QBFqz5nzTs/X0UnLl8jnt0Qdsf44BlIIZcJ9oldXFKAAWUZ3wlHTdz8ll+EBA31O1hkjAqRY4RDvS1hk842pRxXae3Dfodnjhz24="
+    - secure: "pOUA/hwXvpwt7VeRIoAZPiIn2qc88c8/sx1AhN3YhSyCiERLEtuxZqFmCgZE/80U41sBlvg75lpvXpEsND4eriYiRNMDPyD7el2NYxTzseWAykZYe1+Gaeiq1mO83w4pTI7QUrrkU/9+rl9Ccqe6E0heER510ERyLH0nGb8vaRM="
 
 branches:
-  excludes:
+  except:
     - gh-pages
 
 notifications:
   email: false
 
-before_install:
-  - wget http://dl.google.com/android/android-sdk_r21.0.1-linux.tgz
-  - tar -zxf android-sdk_r21.0.1-linux.tgz
-  - export ANDROID_HOME=~/builds/square/spoon/android-sdk-linux
-  - export PATH=${PATH}:${ANDROID_HOME}/tools:${ANDROID_HOME}/platform-tools
-  - TOOLS=$(android list sdk --no-ui | grep "Android SDK Platform-tools" | cut -d"-" -f1)
-  - android update sdk --filter "$TOOLS" --no-ui --force
-  - SDK=$(android list sdk --no-ui | grep ", API 16," | cut -d"-" -f1)
-  - android update sdk --filter "$SDK" --no-ui --force
+sudo: false
+
+cache:
+  directories:
+    - $HOME/.m2

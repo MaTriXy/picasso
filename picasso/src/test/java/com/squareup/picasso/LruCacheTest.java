@@ -126,6 +126,15 @@ public class LruCacheTest {
     assertSnapshot(cache, "b", B);
   }
 
+  @Test public void throwsWithNullKey() {
+    LruCache cache = new LruCache(1);
+    try {
+      cache.get(null);
+      fail("Expected NullPointerException");
+    } catch (NullPointerException expected) {
+    }
+  }
+
   /**
    * Replacing the value for a key doesn't cause an eviction but it does bring the replaced entry to
    * the front of the queue.
@@ -147,6 +156,26 @@ public class LruCacheTest {
     cache.set("c", C);
     cache.evictAll();
     assertThat(cache.map).isEmpty();
+  }
+
+  @Test public void clearPrefixedKey() {
+    LruCache cache = new LruCache(3);
+
+    cache.set("Hello\nAlice!", A);
+    cache.set("Hello\nBob!", B);
+    cache.set("Hello\nEve!", C);
+    cache.set("Hellos\nWorld!", D);
+
+    cache.clearKeyUri("Hello");
+    assertThat(cache.map).hasSize(1).containsKey("Hellos\nWorld!");
+  }
+
+  @Test public void invalidate() {
+    LruCache cache = new LruCache(3);
+    cache.set("Hello\nAlice!", A);
+    assertThat(cache.size()).isEqualTo(1);
+    cache.clearKeyUri("Hello");
+    assertThat(cache.size()).isZero();
   }
 
   private void assertHit(LruCache cache, String key, Bitmap value) {

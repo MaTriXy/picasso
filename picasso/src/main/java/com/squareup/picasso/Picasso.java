@@ -1,475 +1,680 @@
+/*
+ * Copyright (C) 2013 Square, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.squareup.picasso;
 
-import android.content.ContentResolver;
 import android.content.Context;
-import android.content.res.Resources;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Matrix;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+import android.os.Process;
 import android.widget.ImageView;
+import android.widget.RemoteViews;
 import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
+import java.lang.ref.ReferenceQueue;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
-import static com.squareup.picasso.Loader.Response;
-import static com.squareup.picasso.Request.Type;
-import static com.squareup.picasso.Utils.calculateInSampleSize;
+import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
+import static com.squareup.picasso.Action.RequestWeakReference;
+import static com.squareup.picasso.Dispatcher.HUNTER_BATCH_COMPLETE;
+import static com.squareup.picasso.Dispatcher.REQUEST_BATCH_RESUME;
+import static com.squareup.picasso.Dispatcher.REQUEST_GCED;
+import static com.squareup.picasso.MemoryPolicy.shouldReadFromMemoryCache;
+import static com.squareup.picasso.Picasso.LoadedFrom.MEMORY;
+import static com.squareup.picasso.Utils.OWNER_MAIN;
+import static com.squareup.picasso.Utils.THREAD_PREFIX;
+import static com.squareup.picasso.Utils.VERB_CANCELED;
+import static com.squareup.picasso.Utils.VERB_COMPLETED;
+import static com.squareup.picasso.Utils.VERB_ERRORED;
+import static com.squareup.picasso.Utils.VERB_RESUMED;
+import static com.squareup.picasso.Utils.checkMain;
+import static com.squareup.picasso.Utils.log;
 
 /**
  * Image downloading, transformation, and caching manager.
- * <p/>
+ * <p>
  * Use {@link #with(android.content.Context)} for the global singleton instance or construct your
  * own instance with {@link Builder}.
  */
 public class Picasso {
-  private static final int RETRY_DELAY = 500;
-  private static final int REQUEST_COMPLETE = 1;
-  private static final int REQUEST_RETRY = 2;
-  private static final int REQUEST_DECODE_FAILED = 3;
 
-  private static final String FILE_SCHEME = "file:";
-  private static final String CONTENT_SCHEME = "content:";
+  /** Callbacks for Picasso events. */
+  public interface Listener {
+    /**
+     * Invoked when an image has failed to load. This is useful for reporting image failures to a
+     * remote analytics service, for example.
+     */
+    void onImageLoadFailed(Picasso picasso, Uri uri, Exception exception);
+  }
 
   /**
-   * Global lock for bitmap decoding to ensure that we are only are decoding one at a time. Since
-   * this will only ever happen in background threads we help avoid excessive memory thrashing as
-   * well as potential OOMs. Shamelessly stolen from Volley.
+   * A transformer that is called immediately before every request is submitted. This can be used to
+   * modify any information about a request.
+   * <p>
+   * For example, if you use a CDN you can change the hostname for the image based on the current
+   * location of the user in order to get faster download speeds.
+   * <p>
+   * <b>NOTE:</b> This is a beta feature. The API is subject to change in a backwards incompatible
+   * way at any time.
    */
-  private static final Object DECODE_LOCK = new Object();
+  public interface RequestTransformer {
+    /**
+     * Transform a request before it is submitted to be processed.
+     *
+     * @return The original request or a new request to replace it. Must not be null.
+     */
+    Request transformRequest(Request request);
 
-  // TODO This should be static.
-  final Handler handler = new Handler(Looper.getMainLooper()) {
-    @Override public void handleMessage(Message msg) {
-      Request request = (Request) msg.obj;
-      if (request.future.isCancelled() || request.retryCancelled) {
-        return;
+    /** A {@link RequestTransformer} which returns the original request. */
+    RequestTransformer IDENTITY = new RequestTransformer() {
+      @Override public Request transformRequest(Request request) {
+        return request;
       }
+    };
+  }
 
-      Picasso picasso = request.picasso;
+  /**
+   * The priority of a request.
+   *
+   * @see RequestCreator#priority(Priority)
+   */
+  public enum Priority {
+    LOW,
+    NORMAL,
+    HIGH
+  }
+
+  static final String TAG = "Picasso";
+  static final Handler HANDLER = new Handler(Looper.getMainLooper()) {
+    @Override public void handleMessage(Message msg) {
       switch (msg.what) {
-        case REQUEST_COMPLETE:
-          picasso.targetsToRequests.remove(request.getTarget());
-          request.complete();
+        case HUNTER_BATCH_COMPLETE: {
+          @SuppressWarnings("unchecked") List<BitmapHunter> batch = (List<BitmapHunter>) msg.obj;
+          //noinspection ForLoopReplaceableByForEach
+          for (int i = 0, n = batch.size(); i < n; i++) {
+            BitmapHunter hunter = batch.get(i);
+            hunter.picasso.complete(hunter);
+          }
           break;
-
-        case REQUEST_RETRY:
-          picasso.retry(request);
+        }
+        case REQUEST_GCED: {
+          Action action = (Action) msg.obj;
+          if (action.getPicasso().loggingEnabled) {
+            log(OWNER_MAIN, VERB_CANCELED, action.request.logId(), "target got garbage collected");
+          }
+          action.picasso.cancelExistingRequest(action.getTarget());
           break;
-
-        case REQUEST_DECODE_FAILED:
-          picasso.targetsToRequests.remove(request.getTarget());
-          request.error();
+        }
+        case REQUEST_BATCH_RESUME:
+          @SuppressWarnings("unchecked") List<Action> batch = (List<Action>) msg.obj;
+          //noinspection ForLoopReplaceableByForEach
+          for (int i = 0, n = batch.size(); i < n; i++) {
+            Action action = batch.get(i);
+            action.picasso.resumeAction(action);
+          }
           break;
-
         default:
           throw new AssertionError("Unknown handler message received: " + msg.what);
       }
     }
   };
 
-  static Picasso singleton = null;
+  static volatile Picasso singleton = null;
+
+  private final Listener listener;
+  private final RequestTransformer requestTransformer;
+  private final CleanupThread cleanupThread;
+  private final List<RequestHandler> requestHandlers;
 
   final Context context;
-  final Loader loader;
-  final ExecutorService service;
+  final Dispatcher dispatcher;
   final Cache cache;
-  final Map<Object, Request> targetsToRequests;
   final Stats stats;
+  final Map<Object, Action> targetToAction;
+  final Map<ImageView, DeferredRequestCreator> targetToDeferredRequestCreator;
+  final ReferenceQueue<Object> referenceQueue;
+  final Bitmap.Config defaultBitmapConfig;
 
-  boolean debugging;
+  boolean indicatorsEnabled;
+  volatile boolean loggingEnabled;
 
-  Picasso(Context context, Loader loader, ExecutorService service, Cache cache, Stats stats) {
+  boolean shutdown;
+
+  Picasso(Context context, Dispatcher dispatcher, Cache cache, Listener listener,
+      RequestTransformer requestTransformer, List<RequestHandler> extraRequestHandlers, Stats stats,
+      Bitmap.Config defaultBitmapConfig, boolean indicatorsEnabled, boolean loggingEnabled) {
     this.context = context;
-    this.loader = loader;
-    this.service = service;
+    this.dispatcher = dispatcher;
     this.cache = cache;
+    this.listener = listener;
+    this.requestTransformer = requestTransformer;
+    this.defaultBitmapConfig = defaultBitmapConfig;
+
+    int builtInHandlers = 7; // Adjust this as internal handlers are added or removed.
+    int extraCount = (extraRequestHandlers != null ? extraRequestHandlers.size() : 0);
+    List<RequestHandler> allRequestHandlers =
+        new ArrayList<RequestHandler>(builtInHandlers + extraCount);
+
+    // ResourceRequestHandler needs to be the first in the list to avoid
+    // forcing other RequestHandlers to perform null checks on request.uri
+    // to cover the (request.resourceId != 0) case.
+    allRequestHandlers.add(new ResourceRequestHandler(context));
+    if (extraRequestHandlers != null) {
+      allRequestHandlers.addAll(extraRequestHandlers);
+    }
+    allRequestHandlers.add(new ContactsPhotoRequestHandler(context));
+    allRequestHandlers.add(new MediaStoreRequestHandler(context));
+    allRequestHandlers.add(new ContentStreamRequestHandler(context));
+    allRequestHandlers.add(new AssetRequestHandler(context));
+    allRequestHandlers.add(new FileRequestHandler(context));
+    allRequestHandlers.add(new NetworkRequestHandler(dispatcher.downloader, stats));
+    requestHandlers = Collections.unmodifiableList(allRequestHandlers);
+
     this.stats = stats;
-    this.targetsToRequests = new WeakHashMap<Object, Request>();
+    this.targetToAction = new WeakHashMap<Object, Action>();
+    this.targetToDeferredRequestCreator = new WeakHashMap<ImageView, DeferredRequestCreator>();
+    this.indicatorsEnabled = indicatorsEnabled;
+    this.loggingEnabled = loggingEnabled;
+    this.referenceQueue = new ReferenceQueue<Object>();
+    this.cleanupThread = new CleanupThread(referenceQueue, HANDLER);
+    this.cleanupThread.start();
   }
 
   /** Cancel any existing requests for the specified target {@link ImageView}. */
   public void cancelRequest(ImageView view) {
-    cancelExistingRequest(view, null);
+    cancelExistingRequest(view);
   }
 
-  /** Cancel and existing requests for the specified {@link Target} instance. */
+  /** Cancel any existing requests for the specified {@link Target} instance. */
   public void cancelRequest(Target target) {
-    cancelExistingRequest(target, null);
+    cancelExistingRequest(target);
   }
 
   /**
-   * Start an image request using the specified path. This path may be a remote URL, file resource,
-   * or content provider resource.
+   * Cancel any existing requests for the specified {@link RemoteViews} target with the given {@code
+   * viewId}.
    */
-  public RequestBuilder load(String path) {
-    if (path == null || path.trim().length() == 0) {
+  public void cancelRequest(RemoteViews remoteViews, int viewId) {
+    cancelExistingRequest(new RemoteViewsAction.RemoteViewsTarget(remoteViews, viewId));
+  }
+
+  /**
+   * Cancel any existing requests with given tag. You can set a tag
+   * on new requests with {@link RequestCreator#tag(Object)}.
+   *
+   * @see RequestCreator#tag(Object)
+   */
+  public void cancelTag(Object tag) {
+    checkMain();
+    List<Action> actions = new ArrayList<Action>(targetToAction.values());
+    //noinspection ForLoopReplaceableByForEach
+    for (int i = 0, n = actions.size(); i < n; i++) {
+      Action action = actions.get(i);
+      if (action.getTag().equals(tag)) {
+        cancelExistingRequest(action.getTarget());
+      }
+    }
+  }
+
+  /**
+   * Pause existing requests with the given tag. Use {@link #resumeTag(Object)}
+   * to resume requests with the given tag.
+   *
+   * @see #resumeTag(Object)
+   * @see RequestCreator#tag(Object)
+   */
+  public void pauseTag(Object tag) {
+    dispatcher.dispatchPauseTag(tag);
+  }
+
+  /**
+   * Resume paused requests with the given tag. Use {@link #pauseTag(Object)}
+   * to pause requests with the given tag.
+   *
+   * @see #pauseTag(Object)
+   * @see RequestCreator#tag(Object)
+   */
+  public void resumeTag(Object tag) {
+    dispatcher.dispatchResumeTag(tag);
+  }
+
+  /**
+   * Start an image request using the specified URI.
+   * <p>
+   * Passing {@code null} as a {@code uri} will not trigger any request but will set a placeholder,
+   * if one is specified.
+   *
+   * @see #load(File)
+   * @see #load(String)
+   * @see #load(int)
+   */
+  public RequestCreator load(Uri uri) {
+    return new RequestCreator(this, uri, 0);
+  }
+
+  /**
+   * Start an image request using the specified path. This is a convenience method for calling
+   * {@link #load(Uri)}.
+   * <p>
+   * This path may be a remote URL, file resource (prefixed with {@code file:}), content resource
+   * (prefixed with {@code content:}), or android resource (prefixed with {@code
+   * android.resource:}.
+   * <p>
+   * Passing {@code null} as a {@code path} will not trigger any request but will set a
+   * placeholder, if one is specified.
+   *
+   * @see #load(Uri)
+   * @see #load(File)
+   * @see #load(int)
+   * @throws IllegalArgumentException if {@code path} is empty or blank string.
+   */
+  public RequestCreator load(String path) {
+    if (path == null) {
+      return new RequestCreator(this, null, 0);
+    }
+    if (path.trim().length() == 0) {
       throw new IllegalArgumentException("Path must not be empty.");
     }
-    if (path.startsWith(FILE_SCHEME)) {
-      return new RequestBuilder(this, Uri.parse(path).getPath(), Type.FILE);
-    }
-    if (path.startsWith(CONTENT_SCHEME)) {
-      return new RequestBuilder(this, path, Type.CONTENT);
-    }
-    return new RequestBuilder(this, path, Type.STREAM);
+    return load(Uri.parse(path));
   }
 
-  /** Start an image request using the specified image file. */
-  public RequestBuilder load(File file) {
+  /**
+   * Start an image request using the specified image file. This is a convenience method for
+   * calling {@link #load(Uri)}.
+   * <p>
+   * Passing {@code null} as a {@code file} will not trigger any request but will set a
+   * placeholder, if one is specified.
+   * <p>
+   * Equivalent to calling {@link #load(Uri) load(Uri.fromFile(file))}.
+   *
+   * @see #load(Uri)
+   * @see #load(String)
+   * @see #load(int)
+   */
+  public RequestCreator load(File file) {
     if (file == null) {
-      throw new IllegalArgumentException("File must not be null.");
+      return new RequestCreator(this, null, 0);
     }
-    return new RequestBuilder(this, file.getPath(), Type.FILE);
+    return load(Uri.fromFile(file));
   }
 
-  /** Start an image request using the specified drawable resource ID. */
-  public RequestBuilder load(int resourceId) {
+  /**
+   * Start an image request using the specified drawable resource ID.
+   *
+   * @see #load(Uri)
+   * @see #load(String)
+   * @see #load(File)
+   */
+  public RequestCreator load(int resourceId) {
     if (resourceId == 0) {
       throw new IllegalArgumentException("Resource ID must not be zero.");
     }
-    return new RequestBuilder(this, resourceId);
+    return new RequestCreator(this, null, resourceId);
   }
 
-  /** {@code true} if debug display, logging, and statistics are enabled. */
-  public boolean isDebugging() {
-    return debugging;
+  /**
+   * Invalidate all memory cached images for the specified {@code uri}.
+   *
+   * @see #invalidate(String)
+   * @see #invalidate(File)
+   */
+  public void invalidate(Uri uri) {
+    if (uri == null) {
+      throw new IllegalArgumentException("uri == null");
+    }
+    cache.clearKeyUri(uri.toString());
   }
 
-  /** Toggle whether debug display, logging, and statistics are enabled. */
-  public void setDebugging(boolean debugging) {
-    this.debugging = debugging;
+  /**
+   * Invalidate all memory cached images for the specified {@code path}. You can also pass a
+   * {@linkplain RequestCreator#stableKey stable key}.
+   *
+   * @see #invalidate(Uri)
+   * @see #invalidate(File)
+   */
+  public void invalidate(String path) {
+    if (path == null) {
+      throw new IllegalArgumentException("path == null");
+    }
+    invalidate(Uri.parse(path));
   }
 
-  /** Creates a {@link StatsSnapshot} of the current stats for this instance. */
-  public StatsSnapshot getSnapshot() {
+  /**
+   * Invalidate all memory cached images for the specified {@code file}.
+   *
+   * @see #invalidate(Uri)
+   * @see #invalidate(String)
+   */
+  public void invalidate(File file) {
+    if (file == null) {
+      throw new IllegalArgumentException("file == null");
+    }
+    invalidate(Uri.fromFile(file));
+  }
+
+  /**
+   * {@code true} if debug display, logging, and statistics are enabled.
+   * <p>
+   * @deprecated Use {@link #areIndicatorsEnabled()} and {@link #isLoggingEnabled()} instead.
+   */
+  @SuppressWarnings("UnusedDeclaration") @Deprecated public boolean isDebugging() {
+    return areIndicatorsEnabled() && isLoggingEnabled();
+  }
+
+  /**
+   * Toggle whether debug display, logging, and statistics are enabled.
+   * <p>
+   * @deprecated Use {@link #setIndicatorsEnabled(boolean)} and {@link #setLoggingEnabled(boolean)}
+   * instead.
+   */
+  @SuppressWarnings("UnusedDeclaration") @Deprecated public void setDebugging(boolean debugging) {
+    setIndicatorsEnabled(debugging);
+  }
+
+  /** Toggle whether to display debug indicators on images. */
+  @SuppressWarnings("UnusedDeclaration") public void setIndicatorsEnabled(boolean enabled) {
+    indicatorsEnabled = enabled;
+  }
+
+  /** {@code true} if debug indicators should are displayed on images. */
+  @SuppressWarnings("UnusedDeclaration") public boolean areIndicatorsEnabled() {
+    return indicatorsEnabled;
+  }
+
+  /**
+   * Toggle whether debug logging is enabled.
+   * <p>
+   * <b>WARNING:</b> Enabling this will result in excessive object allocation. This should be only
+   * be used for debugging Picasso behavior. Do NOT pass {@code BuildConfig.DEBUG}.
+   */
+  @SuppressWarnings("UnusedDeclaration") // Public API.
+  public void setLoggingEnabled(boolean enabled) {
+    loggingEnabled = enabled;
+  }
+
+  /** {@code true} if debug logging is enabled. */
+  public boolean isLoggingEnabled() {
+    return loggingEnabled;
+  }
+
+  /**
+   * Creates a {@link StatsSnapshot} of the current stats for this instance.
+   * <p>
+   * <b>NOTE:</b> The snapshot may not always be completely up-to-date if requests are still in
+   * progress.
+   */
+  @SuppressWarnings("UnusedDeclaration") public StatsSnapshot getSnapshot() {
     return stats.createSnapshot();
   }
 
-  void submit(Request request) {
-    Object target = request.getTarget();
-    if (target == null) return;
-
-    cancelExistingRequest(target, request.path);
-
-    targetsToRequests.put(target, request);
-    request.future = service.submit(request);
-  }
-
-  void run(Request request) {
-    try {
-      Bitmap result = resolveRequest(request);
-
-      if (result == null) {
-        handler.sendMessage(handler.obtainMessage(REQUEST_DECODE_FAILED, request));
-        return;
-      }
-
-      request.result = result;
-      handler.sendMessage(handler.obtainMessage(REQUEST_COMPLETE, request));
-    } catch (IOException e) {
-      handler.sendMessageDelayed(handler.obtainMessage(REQUEST_RETRY, request), RETRY_DELAY);
+  /** Stops this instance from accepting further requests. */
+  public void shutdown() {
+    if (this == singleton) {
+      throw new UnsupportedOperationException("Default singleton instance cannot be shutdown.");
     }
-  }
-
-  Bitmap resolveRequest(Request request) throws IOException {
-    Bitmap bitmap = loadFromCache(request);
-    if (bitmap == null) {
-      stats.cacheMiss();
-      bitmap = loadFromType(request);
-
-      if (bitmap != null && !request.skipCache) {
-        cache.set(request.key, bitmap);
-      }
-    } else {
-      stats.cacheHit();
+    if (shutdown) {
+      return;
     }
-    return bitmap;
+    cache.clear();
+    cleanupThread.shutdown();
+    stats.shutdown();
+    dispatcher.shutdown();
+    for (DeferredRequestCreator deferredRequestCreator : targetToDeferredRequestCreator.values()) {
+      deferredRequestCreator.cancel();
+    }
+    targetToDeferredRequestCreator.clear();
+    shutdown = true;
   }
 
-  Bitmap quickMemoryCacheCheck(Object target, String key) {
+  List<RequestHandler> getRequestHandlers() {
+    return requestHandlers;
+  }
+
+  Request transformRequest(Request request) {
+    Request transformed = requestTransformer.transformRequest(request);
+    if (transformed == null) {
+      throw new IllegalStateException("Request transformer "
+          + requestTransformer.getClass().getCanonicalName()
+          + " returned null for "
+          + request);
+    }
+    return transformed;
+  }
+
+  void defer(ImageView view, DeferredRequestCreator request) {
+    targetToDeferredRequestCreator.put(view, request);
+  }
+
+  void enqueueAndSubmit(Action action) {
+    Object target = action.getTarget();
+    if (target != null && targetToAction.get(target) != action) {
+      // This will also check we are on the main thread.
+      cancelExistingRequest(target);
+      targetToAction.put(target, action);
+    }
+    submit(action);
+  }
+
+  void submit(Action action) {
+    dispatcher.dispatchSubmit(action);
+  }
+
+  Bitmap quickMemoryCacheCheck(String key) {
     Bitmap cached = cache.get(key);
-    cancelExistingRequest(target, key);
-
     if (cached != null) {
-      stats.cacheHit();
-    }
-
-    return cached;
-  }
-
-  void retry(Request request) {
-    if (request.retryCancelled) return;
-
-    if (request.retryCount > 0) {
-      request.retryCount--;
-      submit(request);
+      stats.dispatchCacheHit();
     } else {
-      targetsToRequests.remove(request.getTarget());
-      request.error();
-    }
-  }
-
-  Bitmap decodeStream(InputStream stream, PicassoBitmapOptions bitmapOptions) {
-    if (stream == null) return null;
-    synchronized (DECODE_LOCK) {
-      return BitmapFactory.decodeStream(stream, null, bitmapOptions);
-    }
-  }
-
-  Bitmap decodeContentStream(Uri path, PicassoBitmapOptions bitmapOptions) throws IOException {
-    ContentResolver contentResolver = context.getContentResolver();
-    if (bitmapOptions != null && bitmapOptions.inJustDecodeBounds) {
-      BitmapFactory.decodeStream(contentResolver.openInputStream(path), null, bitmapOptions);
-      calculateInSampleSize(bitmapOptions);
-    }
-    synchronized (DECODE_LOCK) {
-      return BitmapFactory.decodeStream(contentResolver.openInputStream(path), null, bitmapOptions);
-    }
-  }
-
-  Bitmap decodeFile(String path, PicassoBitmapOptions bitmapOptions) {
-    if (bitmapOptions != null && bitmapOptions.inJustDecodeBounds) {
-      BitmapFactory.decodeFile(path, bitmapOptions);
-      calculateInSampleSize(bitmapOptions);
-    }
-    synchronized (DECODE_LOCK) {
-      return BitmapFactory.decodeFile(path, bitmapOptions);
-    }
-  }
-
-  Bitmap decodeResource(Resources resources, int resourceId, PicassoBitmapOptions bitmapOptions) {
-    if (bitmapOptions != null && bitmapOptions.inJustDecodeBounds) {
-      BitmapFactory.decodeResource(resources, resourceId, bitmapOptions);
-      calculateInSampleSize(bitmapOptions);
-    }
-    synchronized (DECODE_LOCK) {
-      return BitmapFactory.decodeResource(resources, resourceId, bitmapOptions);
-    }
-  }
-
-  private void cancelExistingRequest(Object target, String path) {
-    Request existing = targetsToRequests.remove(target);
-    if (existing != null) {
-      if (!existing.future.isDone()) {
-        existing.future.cancel(true);
-      } else if (path == null || !path.equals(existing.path)) {
-        existing.retryCancelled = true;
-      }
-    }
-  }
-
-  private Bitmap loadFromCache(Request request) {
-    if (request.skipCache) return null;
-
-    Bitmap cached = cache.get(request.key);
-    if (cached != null) {
-      request.loadedFrom = Request.LoadedFrom.MEMORY;
+      stats.dispatchCacheMiss();
     }
     return cached;
   }
 
-  private Bitmap loadFromType(Request request) throws IOException {
-    PicassoBitmapOptions options = request.options;
+  void complete(BitmapHunter hunter) {
+    Action single = hunter.getAction();
+    List<Action> joined = hunter.getActions();
 
-    int exifRotation = 0;
-    Bitmap result = null;
+    boolean hasMultiple = joined != null && !joined.isEmpty();
+    boolean shouldDeliver = single != null || hasMultiple;
 
-    switch (request.type) {
-      case CONTENT:
-        Uri path = Uri.parse(request.path);
-        exifRotation = Utils.getContentProviderExifRotation(path, context.getContentResolver());
-        result = decodeContentStream(path, options);
-        request.loadedFrom = Request.LoadedFrom.DISK;
-        break;
-      case RESOURCE:
-        Resources resources = context.getResources();
-        result = decodeResource(resources, request.resourceId, options);
-        request.loadedFrom = Request.LoadedFrom.DISK;
-        break;
-      case FILE:
-        exifRotation = Utils.getFileExifRotation(request.path);
-        result = decodeFile(request.path, options);
-        request.loadedFrom = Request.LoadedFrom.DISK;
-        break;
-      case STREAM:
-        Response response = null;
+    if (!shouldDeliver) {
+      return;
+    }
+
+    Uri uri = hunter.getData().uri;
+    Exception exception = hunter.getException();
+    Bitmap result = hunter.getResult();
+    LoadedFrom from = hunter.getLoadedFrom();
+
+    if (single != null) {
+      deliverAction(result, from, single);
+    }
+
+    if (hasMultiple) {
+      //noinspection ForLoopReplaceableByForEach
+      for (int i = 0, n = joined.size(); i < n; i++) {
+        Action join = joined.get(i);
+        deliverAction(result, from, join);
+      }
+    }
+
+    if (listener != null && exception != null) {
+      listener.onImageLoadFailed(this, uri, exception);
+    }
+  }
+
+  void resumeAction(Action action) {
+    Bitmap bitmap = null;
+    if (shouldReadFromMemoryCache(action.memoryPolicy)) {
+      bitmap = quickMemoryCacheCheck(action.getKey());
+    }
+
+    if (bitmap != null) {
+      // Resumed action is cached, complete immediately.
+      deliverAction(bitmap, MEMORY, action);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_COMPLETED, action.request.logId(), "from " + MEMORY);
+      }
+    } else {
+      // Re-submit the action to the executor.
+      enqueueAndSubmit(action);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_RESUMED, action.request.logId());
+      }
+    }
+  }
+
+  private void deliverAction(Bitmap result, LoadedFrom from, Action action) {
+    if (action.isCancelled()) {
+      return;
+    }
+    if (!action.willReplay()) {
+      targetToAction.remove(action.getTarget());
+    }
+    if (result != null) {
+      if (from == null) {
+        throw new AssertionError("LoadedFrom cannot be null.");
+      }
+      action.complete(result, from);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_COMPLETED, action.request.logId(), "from " + from);
+      }
+    } else {
+      action.error();
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_ERRORED, action.request.logId());
+      }
+    }
+  }
+
+  private void cancelExistingRequest(Object target) {
+    checkMain();
+    Action action = targetToAction.remove(target);
+    if (action != null) {
+      action.cancel();
+      dispatcher.dispatchCancel(action);
+    }
+    if (target instanceof ImageView) {
+      ImageView targetImageView = (ImageView) target;
+      DeferredRequestCreator deferredRequestCreator =
+          targetToDeferredRequestCreator.remove(targetImageView);
+      if (deferredRequestCreator != null) {
+        deferredRequestCreator.cancel();
+      }
+    }
+  }
+
+  private static class CleanupThread extends Thread {
+    private final ReferenceQueue<?> referenceQueue;
+    private final Handler handler;
+
+    CleanupThread(ReferenceQueue<?> referenceQueue, Handler handler) {
+      this.referenceQueue = referenceQueue;
+      this.handler = handler;
+      setDaemon(true);
+      setName(THREAD_PREFIX + "refQueue");
+    }
+
+    @Override public void run() {
+      Process.setThreadPriority(THREAD_PRIORITY_BACKGROUND);
+      while (true) {
         try {
-          response = loader.load(request.path, request.retryCount == 0);
-          if (response == null) {
-            return null;
-          }
-          result = decodeStream(response.stream, options);
-        } finally {
-          if (response != null && response.stream != null) {
-            try {
-              response.stream.close();
-            } catch (IOException ignored) {
+          RequestWeakReference<?> remove = (RequestWeakReference<?>) referenceQueue.remove();
+          handler.sendMessage(handler.obtainMessage(REQUEST_GCED, remove.action));
+        } catch (InterruptedException e) {
+          break;
+        } catch (final Exception e) {
+          handler.post(new Runnable() {
+            @Override public void run() {
+              throw new RuntimeException(e);
             }
-          }
-        }
-        request.loadedFrom = response.cached ? Request.LoadedFrom.DISK : Request.LoadedFrom.NETWORK;
-        break;
-      default:
-        throw new AssertionError("Unknown request type: " + request.type);
-    }
-
-    if (result == null) {
-      return null;
-    }
-
-    stats.bitmapDecoded(result);
-
-    // If the caller wants deferred resize, try to load the target ImageView's measured size.
-    if (options != null && options.deferredResize) {
-      ImageView target = request.target.get();
-      if (target != null) {
-        int targetWidth = target.getMeasuredWidth();
-        int targetHeight = target.getMeasuredHeight();
-        if (targetWidth != 0 && targetHeight != 0) {
-          options.targetWidth = targetWidth;
-          options.targetHeight = targetHeight;
+          });
+          break;
         }
       }
     }
 
-    if (options != null || exifRotation != 0) {
-      result = transformResult(options, result, exifRotation);
+    void shutdown() {
+      interrupt();
     }
-
-    List<Transformation> transformations = request.transformations;
-    if (transformations != null) {
-      result = applyCustomTransformations(transformations, result);
-      stats.bitmapTransformed(result);
-    }
-
-    return result;
   }
 
-  static Bitmap transformResult(PicassoBitmapOptions options, Bitmap result, int exifRotation) {
-    int inWidth = result.getWidth();
-    int inHeight = result.getHeight();
-
-    int drawX = 0;
-    int drawY = 0;
-    int drawWidth = inWidth;
-    int drawHeight = inHeight;
-
-    Matrix matrix = new Matrix();
-
-    if (options != null) {
-      int targetWidth = options.targetWidth;
-      int targetHeight = options.targetHeight;
-
-      float targetRotation = options.targetRotation;
-      if (targetRotation != 0) {
-        if (options.hasRotationPivot) {
-          matrix.setRotate(targetRotation, options.targetPivotX, options.targetPivotY);
-        } else {
-          matrix.setRotate(targetRotation);
-        }
-      }
-
-      if (options.centerCrop) {
-        float widthRatio = targetWidth / (float) inWidth;
-        float heightRatio = targetHeight / (float) inHeight;
-        float scale;
-        if (widthRatio > heightRatio) {
-          scale = widthRatio;
-          int newSize = (int) Math.ceil(inHeight * (heightRatio / widthRatio));
-          drawY = (inHeight - newSize) / 2;
-          drawHeight = newSize;
-        } else {
-          scale = heightRatio;
-          int newSize = (int) Math.ceil(inWidth * (widthRatio / heightRatio));
-          drawX = (inWidth - newSize) / 2;
-          drawWidth = newSize;
-        }
-        matrix.preScale(scale, scale);
-      } else if (targetWidth != 0 && targetHeight != 0 //
-          && (targetWidth != inWidth || targetHeight != inHeight)) {
-        // If an explicit target size has been specified and they do not match the results bounds,
-        // pre-scale the existing matrix appropriately.
-        float sx = targetWidth / (float) inWidth;
-        float sy = targetHeight / (float) inHeight;
-        matrix.preScale(sx, sy);
-      }
-
-      float targetScaleX = options.targetScaleX;
-      float targetScaleY = options.targetScaleY;
-      if (targetScaleX != 0 || targetScaleY != 0) {
-        matrix.setScale(targetScaleX, targetScaleY);
-      }
-    }
-
-    if (exifRotation != 0) {
-      matrix.preRotate(exifRotation);
-    }
-
-    synchronized (DECODE_LOCK) {
-      Bitmap newResult =
-          Bitmap.createBitmap(result, drawX, drawY, drawWidth, drawHeight, matrix, false);
-      if (newResult != result) {
-        result.recycle();
-        result = newResult;
-      }
-    }
-
-    return result;
-  }
-
-  static Bitmap applyCustomTransformations(List<Transformation> transformations, Bitmap result) {
-    for (int i = 0, count = transformations.size(); i < count; i++) {
-      Transformation transformation = transformations.get(i);
-      Bitmap newResult = transformation.transform(result);
-
-      if (newResult == null) {
-        StringBuilder builder = new StringBuilder() //
-            .append("Transformation ")
-            .append(transformation.key())
-            .append(" returned null after ")
-            .append(i)
-            .append(" previous transformation(s).\n\nTransformation list:\n");
-        for (Transformation t : transformations) {
-          builder.append(t.key()).append('\n');
-        }
-        throw new NullPointerException(builder.toString());
-      }
-
-      // If the transformation returned a new bitmap ensure they recycled the original.
-      if (newResult != result && !result.isRecycled()) {
-        throw new IllegalStateException("Transformation "
-            + transformation.key()
-            + " mutated input Bitmap but failed to recycle the original.");
-      }
-      result = newResult;
-    }
-    return result;
-  }
-
-  /** The global default {@link Picasso} instance. */
+  /**
+   * The global default {@link Picasso} instance.
+   * <p>
+   * This instance is automatically initialized with defaults that are suitable to most
+   * implementations.
+   * <ul>
+   * <li>LRU memory cache of 15% the available application RAM</li>
+   * <li>Disk cache of 2% storage space up to 50MB but no less than 5MB. (Note: this is only
+   * available on API 14+ <em>or</em> if you are using a standalone library that provides a disk
+   * cache on all API levels like OkHttp)</li>
+   * <li>Three download threads for disk and network access.</li>
+   * </ul>
+   * <p>
+   * If these settings do not meet the requirements of your application you can construct your own
+   * with full control over the configuration by using {@link Picasso.Builder} to create a
+   * {@link Picasso} instance. You can either use this directly or by setting it as the global
+   * instance with {@link #setSingletonInstance}.
+   */
   public static Picasso with(Context context) {
     if (singleton == null) {
-      singleton = new Builder(context).build();
+      synchronized (Picasso.class) {
+        if (singleton == null) {
+          singleton = new Builder(context).build();
+        }
+      }
     }
     return singleton;
+  }
+
+  /**
+   * Set the global instance returned from {@link #with}.
+   * <p>
+   * This method must be called before any calls to {@link #with} and may only be called once.
+   */
+  public static void setSingletonInstance(Picasso picasso) {
+    synchronized (Picasso.class) {
+      if (singleton != null) {
+        throw new IllegalStateException("Singleton instance already exists.");
+      }
+      singleton = picasso;
+    }
   }
 
   /** Fluent API for creating {@link Picasso} instances. */
   @SuppressWarnings("UnusedDeclaration") // Public API.
   public static class Builder {
     private final Context context;
-    private Loader loader;
+    private Downloader downloader;
     private ExecutorService service;
-    private Cache memoryCache;
+    private Cache cache;
+    private Listener listener;
+    private RequestTransformer transformer;
+    private List<RequestHandler> requestHandlers;
+    private Bitmap.Config defaultBitmapConfig;
+
+    private boolean indicatorsEnabled;
+    private boolean loggingEnabled;
 
     /** Start building a new {@link Picasso} instance. */
     public Builder(Context context) {
@@ -479,19 +684,35 @@ public class Picasso {
       this.context = context.getApplicationContext();
     }
 
-    /** Specify the {@link Loader} that will be used for downloading images. */
-    public Builder loader(Loader loader) {
-      if (loader == null) {
-        throw new IllegalArgumentException("Loader must not be null.");
+    /**
+     * Specify the default {@link Bitmap.Config} used when decoding images. This can be overridden
+     * on a per-request basis using {@link RequestCreator#config(Bitmap.Config) config(..)}.
+     */
+    public Builder defaultBitmapConfig(Bitmap.Config bitmapConfig) {
+      if (bitmapConfig == null) {
+        throw new IllegalArgumentException("Bitmap config must not be null.");
       }
-      if (this.loader != null) {
-        throw new IllegalStateException("Loader already set.");
-      }
-      this.loader = loader;
+      this.defaultBitmapConfig = bitmapConfig;
       return this;
     }
 
-    /** Specify the executor service for loading images in the background. */
+    /** Specify the {@link Downloader} that will be used for downloading images. */
+    public Builder downloader(Downloader downloader) {
+      if (downloader == null) {
+        throw new IllegalArgumentException("Downloader must not be null.");
+      }
+      if (this.downloader != null) {
+        throw new IllegalStateException("Downloader already set.");
+      }
+      this.downloader = downloader;
+      return this;
+    }
+
+    /**
+     * Specify the executor service for loading images in the background.
+     * <p>
+     * Note: Calling {@link Picasso#shutdown() shutdown()} will not shutdown supplied executors.
+     */
     public Builder executor(ExecutorService executorService) {
       if (executorService == null) {
         throw new IllegalArgumentException("Executor service must not be null.");
@@ -508,10 +729,79 @@ public class Picasso {
       if (memoryCache == null) {
         throw new IllegalArgumentException("Memory cache must not be null.");
       }
-      if (this.memoryCache != null) {
+      if (this.cache != null) {
         throw new IllegalStateException("Memory cache already set.");
       }
-      this.memoryCache = memoryCache;
+      this.cache = memoryCache;
+      return this;
+    }
+
+    /** Specify a listener for interesting events. */
+    public Builder listener(Listener listener) {
+      if (listener == null) {
+        throw new IllegalArgumentException("Listener must not be null.");
+      }
+      if (this.listener != null) {
+        throw new IllegalStateException("Listener already set.");
+      }
+      this.listener = listener;
+      return this;
+    }
+
+    /**
+     * Specify a transformer for all incoming requests.
+     * <p>
+     * <b>NOTE:</b> This is a beta feature. The API is subject to change in a backwards incompatible
+     * way at any time.
+     */
+    public Builder requestTransformer(RequestTransformer transformer) {
+      if (transformer == null) {
+        throw new IllegalArgumentException("Transformer must not be null.");
+      }
+      if (this.transformer != null) {
+        throw new IllegalStateException("Transformer already set.");
+      }
+      this.transformer = transformer;
+      return this;
+    }
+
+    /** Register a {@link RequestHandler}. */
+    public Builder addRequestHandler(RequestHandler requestHandler) {
+      if (requestHandler == null) {
+        throw new IllegalArgumentException("RequestHandler must not be null.");
+      }
+      if (requestHandlers == null) {
+        requestHandlers = new ArrayList<RequestHandler>();
+      }
+      if (requestHandlers.contains(requestHandler)) {
+        throw new IllegalStateException("RequestHandler already registered.");
+      }
+      requestHandlers.add(requestHandler);
+      return this;
+    }
+
+    /**
+     * @deprecated Use {@link #indicatorsEnabled(boolean)} instead.
+     * Whether debugging is enabled or not.
+     */
+    @Deprecated public Builder debugging(boolean debugging) {
+      return indicatorsEnabled(debugging);
+    }
+
+    /** Toggle whether to display debug indicators on images. */
+    public Builder indicatorsEnabled(boolean enabled) {
+      this.indicatorsEnabled = enabled;
+      return this;
+    }
+
+    /**
+     * Toggle whether debug logging is enabled.
+     * <p>
+     * <b>WARNING:</b> Enabling this will result in excessive object allocation. This should be only
+     * be used for debugging purposes. Do NOT pass {@code BuildConfig.DEBUG}.
+     */
+    public Builder loggingEnabled(boolean enabled) {
+      this.loggingEnabled = enabled;
       return this;
     }
 
@@ -519,19 +809,38 @@ public class Picasso {
     public Picasso build() {
       Context context = this.context;
 
-      if (loader == null) {
-        loader = Utils.createDefaultLoader(context);
+      if (downloader == null) {
+        downloader = Utils.createDefaultDownloader(context);
       }
-      if (memoryCache == null) {
-        memoryCache = new LruCache(context);
+      if (cache == null) {
+        cache = new LruCache(context);
       }
       if (service == null) {
-        service = Executors.newFixedThreadPool(3, new Utils.PicassoThreadFactory());
+        service = new PicassoExecutorService();
+      }
+      if (transformer == null) {
+        transformer = RequestTransformer.IDENTITY;
       }
 
-      Stats stats = new Stats(memoryCache);
+      Stats stats = new Stats(cache);
 
-      return new Picasso(context, loader, service, memoryCache, stats);
+      Dispatcher dispatcher = new Dispatcher(context, service, HANDLER, downloader, cache, stats);
+
+      return new Picasso(context, dispatcher, cache, listener, transformer, requestHandlers, stats,
+          defaultBitmapConfig, indicatorsEnabled, loggingEnabled);
+    }
+  }
+
+  /** Describes where the image was loaded from. */
+  public enum LoadedFrom {
+    MEMORY(Color.GREEN),
+    DISK(Color.BLUE),
+    NETWORK(Color.RED);
+
+    final int debugColor;
+
+    private LoadedFrom(int debugColor) {
+      this.debugColor = debugColor;
     }
   }
 }
