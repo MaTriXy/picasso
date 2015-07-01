@@ -22,7 +22,9 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
+import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
 import android.os.Process;
 import android.os.StatFs;
 import android.provider.Settings;
@@ -38,6 +40,7 @@ import java.util.concurrent.ThreadFactory;
 import static android.content.Context.ACTIVITY_SERVICE;
 import static android.content.pm.ApplicationInfo.FLAG_LARGE_HEAP;
 import static android.os.Build.VERSION.SDK_INT;
+import static android.os.Build.VERSION_CODES.GINGERBREAD;
 import static android.os.Build.VERSION_CODES.HONEYCOMB;
 import static android.os.Build.VERSION_CODES.HONEYCOMB_MR1;
 import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
@@ -55,6 +58,7 @@ final class Utils {
   private static final int KEY_PADDING = 50; // Determined by exact science.
   private static final int MIN_DISK_CACHE_SIZE = 5 * 1024 * 1024; // 5MB
   private static final int MAX_DISK_CACHE_SIZE = 50 * 1024 * 1024; // 50MB
+  static final int THREAD_LEAK_CLEANING_MS = 1000;
   static final char KEY_SEPARATOR = '\n';
 
   /** Thread confined to main thread for key creation. */
@@ -242,10 +246,12 @@ final class Utils {
   }
 
   static Downloader createDefaultDownloader(Context context) {
-    try {
-      Class.forName("com.squareup.okhttp.OkHttpClient");
-      return OkHttpLoaderCreator.create(context);
-    } catch (ClassNotFoundException ignored) {
+    if (SDK_INT >= GINGERBREAD) {
+        try {
+          Class.forName("com.squareup.okhttp.OkHttpClient");
+          return OkHttpLoaderCreator.create(context);
+        } catch (ClassNotFoundException ignored) {
+        }
     }
     return new UrlConnectionDownloader(context);
   }
@@ -368,6 +374,20 @@ final class Utils {
     } catch (PackageManager.NameNotFoundException e) {
       throw new FileNotFoundException("Unable to obtain resources for package: " + data.uri);
     }
+  }
+
+  /**
+   * Prior to Android 5, HandlerThread always keeps a stack local reference to the last message
+   * that was sent to it. This method makes sure that stack local reference never stays there
+   * for too long by sending new messages to it every second.
+   */
+  static void flushStackLocalLeaks(Looper looper) {
+    Handler handler = new Handler(looper) {
+      @Override public void handleMessage(Message msg) {
+        sendMessageDelayed(obtainMessage(), THREAD_LEAK_CLEANING_MS);
+      }
+    };
+    handler.sendMessageDelayed(handler.obtainMessage(), THREAD_LEAK_CLEANING_MS);
   }
 
   @TargetApi(HONEYCOMB)

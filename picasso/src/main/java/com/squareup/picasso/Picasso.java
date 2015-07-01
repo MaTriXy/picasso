@@ -42,6 +42,7 @@ import static com.squareup.picasso.Dispatcher.REQUEST_GCED;
 import static com.squareup.picasso.MemoryPolicy.shouldReadFromMemoryCache;
 import static com.squareup.picasso.Picasso.LoadedFrom.MEMORY;
 import static com.squareup.picasso.Utils.OWNER_MAIN;
+import static com.squareup.picasso.Utils.THREAD_LEAK_CLEANING_MS;
 import static com.squareup.picasso.Utils.THREAD_PREFIX;
 import static com.squareup.picasso.Utils.VERB_CANCELED;
 import static com.squareup.picasso.Utils.VERB_COMPLETED;
@@ -226,12 +227,26 @@ public class Picasso {
    */
   public void cancelTag(Object tag) {
     checkMain();
+    if (tag == null) {
+      throw new IllegalArgumentException("Cannot cancel requests with null tag.");
+    }
+
     List<Action> actions = new ArrayList<Action>(targetToAction.values());
     //noinspection ForLoopReplaceableByForEach
     for (int i = 0, n = actions.size(); i < n; i++) {
       Action action = actions.get(i);
-      if (action.getTag().equals(tag)) {
+      if (tag.equals(action.getTag())) {
         cancelExistingRequest(action.getTarget());
+      }
+    }
+
+    List<DeferredRequestCreator> deferredRequestCreators =
+        new ArrayList<DeferredRequestCreator>(targetToDeferredRequestCreator.values());
+    //noinspection ForLoopReplaceableByForEach
+    for (int i = 0, n = deferredRequestCreators.size(); i < n; i++) {
+      DeferredRequestCreator deferredRequestCreator = deferredRequestCreators.get(i);
+      if (tag.equals(deferredRequestCreator.getTag())) {
+        deferredRequestCreator.cancel();
       }
     }
   }
@@ -462,6 +477,10 @@ public class Picasso {
   }
 
   void defer(ImageView view, DeferredRequestCreator request) {
+    // If there is already a deferred request, cancel it.
+    if (targetToDeferredRequestCreator.containsKey(view)) {
+      cancelExistingRequest(view);
+    }
     targetToDeferredRequestCreator.put(view, request);
   }
 
@@ -583,11 +602,16 @@ public class Picasso {
     }
   }
 
+  /**
+   * When the target of an action is weakly reachable but the request hasn't been canceled, it
+   * gets added to the reference queue. This thread empties the reference queue and cancels the
+   * request.
+   */
   private static class CleanupThread extends Thread {
-    private final ReferenceQueue<?> referenceQueue;
+    private final ReferenceQueue<Object> referenceQueue;
     private final Handler handler;
 
-    CleanupThread(ReferenceQueue<?> referenceQueue, Handler handler) {
+    CleanupThread(ReferenceQueue<Object> referenceQueue, Handler handler) {
       this.referenceQueue = referenceQueue;
       this.handler = handler;
       setDaemon(true);
@@ -598,8 +622,21 @@ public class Picasso {
       Process.setThreadPriority(THREAD_PRIORITY_BACKGROUND);
       while (true) {
         try {
-          RequestWeakReference<?> remove = (RequestWeakReference<?>) referenceQueue.remove();
-          handler.sendMessage(handler.obtainMessage(REQUEST_GCED, remove.action));
+          // Prior to Android 5.0, even when there is no local variable, the result from
+          // remove() & obtainMessage() is kept as a stack local variable.
+          // We're forcing this reference to be cleared and replaced by looping every second
+          // when there is nothing to do.
+          // This behavior has been tested and reproduced with heap dumps.
+          RequestWeakReference<?> remove =
+              (RequestWeakReference<?>) referenceQueue.remove(THREAD_LEAK_CLEANING_MS);
+          Message message = handler.obtainMessage();
+          if (remove != null) {
+            message.what = REQUEST_GCED;
+            message.obj = remove.action;
+            handler.sendMessage(message);
+          } else {
+            message.recycle();
+          }
         } catch (InterruptedException e) {
           break;
         } catch (final Exception e) {
@@ -653,6 +690,9 @@ public class Picasso {
    * This method must be called before any calls to {@link #with} and may only be called once.
    */
   public static void setSingletonInstance(Picasso picasso) {
+    if (picasso == null) {
+      throw new IllegalArgumentException("Picasso must not be null.");
+    }
     synchronized (Picasso.class) {
       if (singleton != null) {
         throw new IllegalStateException("Singleton instance already exists.");
