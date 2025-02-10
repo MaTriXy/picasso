@@ -1,46 +1,66 @@
-buildscript {
-  dependencies {
-    classpath dep.androidPlugin
-  }
-}
-
 apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'com.vanniktech.maven.publish'
 
 android {
-  compileSdkVersion rootProject.ext.compileSdkVersion
-  buildToolsVersion rootProject.ext.buildToolsVersion
+  namespace 'com.squareup.picasso3'
+
+  compileSdkVersion libs.versions.compileSdk.get() as int
+
+  defaultConfig {
+    minSdkVersion libs.versions.minSdk.get() as int
+    consumerProguardFiles 'consumer-proguard-rules.txt'
+
+    testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+  }
 
   compileOptions {
-    sourceCompatibility rootProject.ext.sourceCompatibilityVersion
-    targetCompatibility rootProject.ext.targetCompatibilityVersion
+    sourceCompatibility libs.versions.javaTarget.get()
+    targetCompatibility libs.versions.javaTarget.get()
+  }
+
+  kotlinOptions {
+    jvmTarget = libs.versions.javaTarget.get()
   }
 
   lintOptions {
     textOutput 'stdout'
     textReport true
-    lintConfig file('lint.xml')
+    lintConfig rootProject.file('lint.xml')
   }
 
-  dexOptions {
-    preDexLibraries = !rootProject.ext.isCi
-  }
-
-  defaultConfig {
-    minSdkVersion rootProject.ext.minSdkVersion
-
-    consumerProguardFiles 'consumer-proguard-rules.txt'
+  testOptions {
+    unitTests {
+      includeAndroidResources = true
+    }
   }
 }
 
 dependencies {
-  api dep.okhttp
-  compileOnly dep.supportAnnotations
-  testImplementation dep.junit
-  testImplementation dep.truth
-  testImplementation dep.supportV4
-  testImplementation dep.robolectric
-  testImplementation dep.mockito
-  testImplementation dep.mockWebServer
+  api libs.okhttp
+  api libs.okio
+  api libs.androidx.lifecycle
+  implementation libs.androidx.annotations
+  implementation libs.androidx.core
+  implementation libs.androidx.exifInterface
+
+  testImplementation libs.coroutines.test
+  testImplementation libs.junit
+  testImplementation libs.truth
+  testImplementation libs.robolectric
+  testImplementation libs.mockito
+  testImplementation libs.okhttp.mockWebServer
+
+  androidTestImplementation libs.androidx.junit
+  androidTestImplementation libs.androidx.testRunner
+  androidTestImplementation libs.truth
 }
 
-apply from: rootProject.file('gradle/gradle-mvn-push.gradle')
+spotless {
+  kotlin {
+    targetExclude(
+      // Non-Square licensed files
+      "src/test/java/com/squareup/picasso3/PlatformLruCacheTest.kt",
+    )
+  }
+}

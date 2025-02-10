@@ -1,11 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    android:versionCode="1"
-    android:versionName="1.0.0"
-    package="com.example.picasso">
-
-  <uses-sdk android:minSdkVersion="9" android:targetSdkVersion="19"/>
+    xmlns:tools="http://schemas.android.com/tools">
 
   <!-- This is required for Picasso to work. -->
   <uses-permission android:name="android.permission.INTERNET"/>
@@ -18,15 +14,20 @@
   <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
   <!-- Used to load images for contact photos. -->
   <uses-permission android:name="android.permission.READ_CONTACTS"/>
+  <!-- Used to post notifications. -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
   <application
       android:label="@string/app_name"
       android:icon="@drawable/icon"
-      android:theme="@style/Theme.PicassoSample">
+      android:allowBackup="false"
+      android:supportsRtl="false"
+      android:theme="@style/Theme.PicassoSample"
+      tools:ignore="GoogleAppIndexingWarning">
 
     <activity
-        android:label="@string/app_name"
-        android:name=".SampleGridViewActivity">
+        android:name=".SampleGridViewActivity"
+        android:exported="true">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
@@ -34,17 +35,31 @@
       </intent-filter>
     </activity>
 
+    <activity android:name=".SampleComposeActivity"/>
     <activity android:name=".SampleContactsActivity"/>
     <activity android:name=".SampleGalleryActivity"/>
     <activity android:name=".SampleListDetailActivity"/>
 
-    <receiver android:name="SampleWidgetProvider">
+    <receiver
+        android:name="SampleWidgetProvider"
+        android:exported="true">
       <intent-filter>
         <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
       </intent-filter>
       <meta-data android:name="android.appwidget.provider"
           android:resource="@xml/sample_widget_info"/>
     </receiver>
+
+    <provider
+      android:name="androidx.startup.InitializationProvider"
+      android:authorities="${applicationId}.androidx-startup"
+      android:exported="false"
+      tools:node="merge">
+
+      <meta-data
+        android:name="com.example.picasso.PicassoInitializer"
+        android:value="androidx.startup" />
+    </provider>
 
   </application>
 </manifest>

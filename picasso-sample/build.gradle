@@ -1,24 +1,28 @@
-buildscript {
-  dependencies {
-    classpath dep.androidPlugin
-  }
-}
-
 apply plugin: 'com.android.application'
-
-dependencies {
-  implementation dep.supportV4
-  compileOnly dep.supportAnnotations
-  implementation project(':picasso')
-}
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
 
 android {
-  compileSdkVersion rootProject.ext.compileSdkVersion
-  buildToolsVersion rootProject.ext.buildToolsVersion
+  namespace 'com.example.picasso'
+
+  compileSdkVersion libs.versions.compileSdk.get() as int
+
+  defaultConfig {
+    minSdkVersion libs.versions.minSdk.get() as int
+    applicationId 'com.example.picasso'
+  }
+
+  buildFeatures {
+    compose true
+  }
 
   compileOptions {
-    sourceCompatibility rootProject.ext.sourceCompatibilityVersion
-    targetCompatibility rootProject.ext.targetCompatibilityVersion
+    sourceCompatibility libs.versions.javaTarget.get()
+    targetCompatibility libs.versions.javaTarget.get()
+  }
+
+  kotlinOptions {
+    jvmTarget = libs.versions.javaTarget.get()
   }
 
   lintOptions {
@@ -29,23 +33,23 @@ android {
     // https://github.com/square/okhttp/issues/896
     ignore 'InvalidPackage'
   }
+}
 
-  dexOptions {
-    preDexLibraries = !rootProject.ext.isCi
-  }
+dependencies {
+  compileOnly libs.androidx.annotations
+  implementation libs.androidx.core
+  implementation libs.androidx.cursorAdapter
+  implementation libs.androidx.fragment
+  implementation libs.androidx.startup
 
-  defaultConfig {
-    minSdkVersion rootProject.ext.minSdkVersion
-    targetSdkVersion rootProject.ext.targetSdkVersion
-    applicationId 'com.example.picasso'
+  implementation libs.drawablePainter
+  implementation libs.composeUi
+  implementation libs.composeRuntime
+  implementation libs.composeUi.foundation
+  implementation libs.composeUi.material
+  implementation libs.composeUi.uiTooling
 
-    versionCode 1
-    versionName '1.0'
-  }
-
-  buildTypes {
-    debug {
-      applicationIdSuffix '.development'
-    }
-  }
+  implementation projects.picasso
+  implementation projects.picassoStats
+  implementation projects.picassoCompose
 }

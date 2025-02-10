@@ -1,5 +1,10 @@
 rootProject.name = 'picasso-root'
 
 include 'picasso'
+include 'picasso-compose'
+include 'picasso-paparazzi-sample'
 include 'picasso-pollexor'
 include 'picasso-sample'
+include 'picasso-stats'
+
+enableFeaturePreview('TYPESAFE_PROJECT_ACCESSORS')
